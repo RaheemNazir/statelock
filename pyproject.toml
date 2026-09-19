@@ -14,7 +14,7 @@ keywords = ["state tracking", "automata", "length generalization", "transformers
             "neural algorithmic reasoning", "verification"]
 
 [project.urls]
-Source = "https://github.com/USERNAME/statelock"
+Source = "https://github.com/RaheemNazir/statelock"
 
 [tool.setuptools.packages.find]
 include = ["statelock*"]
