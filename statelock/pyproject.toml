@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statelock"
+version = "0.1.0"
+description = "Verified finite machines inside neural networks: induce one from labelled strings or discover it by gradient descent, check it by exhaustive equivalence, and attach it to your model."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = ["numpy>=1.22", "torch>=2.0"]
+keywords = ["state tracking", "automata", "length generalization", "transformers",
+            "neural algorithmic reasoning", "verification"]
+
+[project.urls]
+Source = "https://github.com/USERNAME/statelock"
+
+[tool.setuptools.packages.find]
+include = ["statelock*"]
