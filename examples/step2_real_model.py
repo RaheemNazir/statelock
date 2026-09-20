@@ -1,81 +1,150 @@
-"""STEP 2 -- does a REAL pretrained language model lose the state over length,
-and does supplying the machine's state help?
+"""STEP 2, v2 -- does a real pretrained model track entity state over length,
+and does supplying the verified state help?
 
-NOT RUN HERE: this session cannot download model weights (huggingface.co is
-blocked), so this script is untested. Run it on Colab with a T4 GPU. If it
-errors, send me the error text and I will fix it.
+WHY v1 MEASURED NOTHING. Its numbers had accuracy exactly equal to the majority
+baseline in every row, and the two conditions identical to four decimals. That
+is the signature of a model answering the same token every time: the score was
+just the class balance. Three faults, fixed here.
 
-What it does:
-  * writes the connectivity task as ENGLISH sentences ("Alice knows Bob.")
-  * asks a small open model, by scoring the words " yes" and " no", whether two
-    named people are connected, after passages of growing length
-  * repeats the same questions with one extra sentence supplying the machine's
-    answer state ("Currently connected: Alice, Bob, Carol.")
-  * reports accuracy per length for both conditions, plus the constant baseline
+  1. UNBALANCED. Questions were drawn at random, so the majority class moved
+     around and a constant answer could score 0.57. Cases are now balanced 50/50
+     by construction, so a constant answer scores exactly 0.50 and cannot hide.
+  2. NO FORMAT. A base model given a bare question has no reason to emit yes or
+     no at all. Four worked examples now precede the question.
+  3. UNCALIBRATED. Base models carry a large prior toward one of two answer
+     tokens. The same prompt with the content removed is now scored first, and
+     that bias is subtracted (contextual calibration). Without this, a model
+     that knows the answer can still answer "no" every time.
 
-Install first:   !pip install transformers torch accelerate
-Then:            !python step2_real_model.py
-It writes step2_results.json -- send me that file.
+REPORTED, so a degenerate run is visible rather than silent:
+  accuracy, yes_rate (0.5 means it is actually deciding), mean margin, and the
+  calibration offset. If yes_rate is 0.0 or 1.0, the run is degenerate and the
+  accuracy is meaningless whatever it says.
+
+Usage:  python step2_real_model.py            (default model list)
+        python step2_real_model.py MODEL_ID   (one model)
 """
-import json, itertools, random
+import json, random, sys
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL = "EleutherAI/pythia-160m"      # swap for "gpt2" or "EleutherAI/pythia-410m"
+DEFAULT_MODELS = ["EleutherAI/pythia-160m", "Qwen/Qwen2.5-0.5B-Instruct"]
 NAMES = ["Alice", "Bob", "Carol", "Dave", "Erin"]
-LENGTHS = [8, 16, 32, 64, 128]        # sentences per passage
-N_Q = 60                              # questions per length
-SEEDS = [0, 1, 2]
+LENGTHS = [8, 16, 32, 64, 128]
+N_PER_CLASS = 40            # 40 yes + 40 no at each length
+SEED = 0
+
 
 def make_case(n_sent, rng):
-    """Returns (passage, question, answer, state_sentence)."""
+    """One passage. Returns (passage, answer, state_sentence)."""
     parent = list(range(len(NAMES)))
+
     def find(a):
         while parent[a] != a: a = parent[a]
         return a
+
     sents = []
     for _ in range(n_sent):
         if rng.random() < 0.12:
-            parent = list(range(len(NAMES))); sents.append("Everyone parts ways.")
+            parent = list(range(len(NAMES)))
+            sents.append("Everyone parts ways.")
             continue
         a, b = rng.randrange(len(NAMES)), rng.randrange(len(NAMES))
-        ra, rb = find(a), find(b); parent[ra] = rb
+        parent[find(a)] = find(b)
         sents.append(f"{NAMES[a]} knows {NAMES[b]}.")
     ans = "yes" if find(0) == find(1) else "no"
     group = [NAMES[i] for i in range(len(NAMES)) if find(i) == find(0)]
-    state = "Currently in the same group as Alice: " + ", ".join(group) + "."
-    q = f"Question: are {NAMES[0]} and {NAMES[1]} connected, directly or indirectly? Answer:"
-    return " ".join(sents), q, ans, state
+    state = "Known groups: " + ", ".join(group) + " are connected."
+    return " ".join(sents), ans, state
+
+
+def balanced_cases(n_sent, n_per_class, rng, tries=20000):
+    """Exactly n_per_class yes and n_per_class no, so a constant answer is 0.50."""
+    buckets = {"yes": [], "no": []}
+    for _ in range(tries):
+        passage, ans, state = make_case(n_sent, rng)
+        if len(buckets[ans]) < n_per_class:
+            buckets[ans].append((passage, ans, state))
+        if len(buckets["yes"]) == n_per_class and len(buckets["no"]) == n_per_class:
+            break
+    cases = buckets["yes"] + buckets["no"]
+    rng.shuffle(cases)
+    return cases
+
+
+QUESTION = ("Question: are Alice and Bob connected, directly or indirectly? "
+            "Answer with yes or no.\nAnswer:")
+
+FEWSHOT = (
+    "Alice knows Bob.\n" + QUESTION + " yes\n\n"
+    "Carol knows Dave.\n" + QUESTION + " no\n\n"
+    "Alice knows Carol. Carol knows Bob.\n" + QUESTION + " yes\n\n"
+    "Everyone parts ways. Dave knows Erin.\n" + QUESTION + " no\n\n"
+)
+
+
+def build_prompt(passage, state, use_state):
+    body = passage + ((" " + state) if use_state else "")
+    return FEWSHOT + body + "\n" + QUESTION
+
 
 @torch.no_grad()
-def ask(model, tok, text, device):
-    """Score ' yes' vs ' no' as the next token."""
-    ids = tok(text, return_tensors="pt", truncation=True, max_length=2048).to(device)
-    logits = model(**ids).logits[0, -1]
-    y = tok(" yes").input_ids[-1]; n = tok(" no").input_ids[-1]
-    return "yes" if logits[y] > logits[n] else "no"
+def margin(model, tok, text, yes_id, no_id, device, max_len=3000):
+    """log p(yes) - log p(no) for the next token."""
+    ids = tok(text, return_tensors="pt", truncation=True, max_length=max_len).to(device)
+    logits = model(**ids).logits[0, -1].float()
+    lp = torch.log_softmax(logits, -1)
+    return float(lp[yes_id] - lp[no_id])
+
 
 def main():
+    models = [sys.argv[1]] if len(sys.argv) > 1 else DEFAULT_MODELS
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(MODEL).to(device).eval()
     out = []
-    for L in LENGTHS:
-        for cond in ("plain", "with_state"):
-            hits = 0; total = 0; yes = 0
-            for s in SEEDS:
-                rng = random.Random(1000*s + L)
-                for _ in range(N_Q):
-                    passage, q, ans, state = make_case(L, rng)
-                    text = passage + (" " + state if cond == "with_state" else "") + " " + q
-                    pred = ask(model, tok, text, device)
-                    hits += int(pred == ans); total += 1; yes += int(ans == "yes")
-            rec = {"model": MODEL, "sentences": L, "condition": cond,
-                   "accuracy": round(hits/total, 4), "n": total,
-                   "constant_baseline": round(max(yes/total, 1-yes/total), 4)}
-            print(rec, flush=True); out.append(rec)
+    for model_id in models:
+        print(f"\n=== {model_id} ===", flush=True)
+        tok = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id).to(device).eval()
+        yes_id = tok(" yes", add_special_tokens=False).input_ids[-1]
+        no_id = tok(" no", add_special_tokens=False).input_ids[-1]
+
+        # contextual calibration: the same prompt shape with no content
+        null_prompt = build_prompt("N/A", "N/A", False)
+        offset = margin(model, tok, null_prompt, yes_id, no_id, device)
+        print(f"calibration offset {offset:+.3f}", flush=True)
+
+        for L in LENGTHS:
+            for use_state in (False, True):
+                rng = random.Random(SEED + L)
+                cases = balanced_cases(L, N_PER_CLASS, rng)
+                hits = yes_pred = 0
+                margins = []
+                for passage, ans, state in cases:
+                    m = margin(model, tok, build_prompt(passage, state, use_state),
+                               yes_id, no_id, device) - offset
+                    pred = "yes" if m > 0 else "no"
+                    hits += int(pred == ans); yes_pred += int(pred == "yes")
+                    margins.append(m)
+                n = len(cases)
+                rec = {"model": model_id, "sentences": L,
+                       "condition": "with_state" if use_state else "plain",
+                       "accuracy": round(hits / n, 4),
+                       "yes_rate": round(yes_pred / n, 4),
+                       "mean_margin": round(sum(margins) / n, 4),
+                       "calibration_offset": round(offset, 4),
+                       "n": n, "balanced_baseline": 0.5,
+                       "degenerate": yes_pred in (0, n)}
+                print(rec, flush=True); out.append(rec)
+        del model
+        torch.cuda.empty_cache() if device == "cuda" else None
+
     json.dump(out, open("step2_results.json", "w"), indent=1)
-    print("written step2_results.json")
+    print("\nwritten step2_results.json")
+    deg = [r for r in out if r["degenerate"]]
+    if deg:
+        print(f"WARNING: {len(deg)} of {len(out)} rows are degenerate (the model "
+              f"answered the same token every time). Their accuracy means nothing.")
+
 
 if __name__ == "__main__":
     main()
