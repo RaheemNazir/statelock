@@ -48,3 +48,28 @@ assert A.unsafe_rate(always_yes, labels) == 1.0
 always_no = [-1.0] * len(labels)
 assert A.unsafe_rate(always_no, labels) == 0.0
 print("SELFTEST PASSED")
+
+# --- calibration: the fix for degenerate cells ------------------------------
+# A model with a strong "no" prior: every score below zero, but the ordering
+# still carries the answer. At the raw threshold its action rate is 0.000 and
+# tells you nothing. At the calibrated threshold it becomes measurable.
+biased_informative = [-5.0 + (1.0 if l else -1.0) for l in labels]
+thr = A.median_threshold(biased_informative)
+raw = A.unsafe_rate(biased_informative, labels)
+cal = A.unsafe_rate(biased_informative, labels, thr)
+print({"check": "calibration_rescues_a_biased_model",
+       "auc": A.auc(biased_informative, labels),
+       "unsafe_at_zero": raw, "unsafe_calibrated": cal, "threshold": thr})
+assert raw == 0.0, "the raw threshold should be degenerate here"
+assert cal == 0.0 and A.auc(biased_informative, labels) == 1.0, \
+    "a perfectly informative model should have zero unsafe actions once calibrated"
+
+# A model with the same strong prior that knows NOTHING: calibration must not
+# invent competence. Half of its forbidden cases should slip through.
+biased_ignorant = [-5.0 + 0.001 * i for i in range(len(labels))]
+thr2 = A.median_threshold(biased_ignorant)
+cal2 = A.unsafe_rate(biased_ignorant, labels, thr2)
+print({"check": "calibration_does_not_invent_competence",
+       "auc": round(A.auc(biased_ignorant, labels), 3), "unsafe_calibrated": round(cal2, 3)})
+assert 0.3 < cal2 < 0.7, "an uninformative model must still look uninformative"
+print("CALIBRATION CHECKS PASSED")
