@@ -1,8 +1,8 @@
 """Tests that re-derive the paper's claims through the public API."""
-import sys, numpy as np, torch
-sys.path.insert(0, '/home/claude/pkg/statelock'); sys.path.insert(0, '/home/claude/disc')
+import os, sys, numpy as np, torch
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from statelock import induce, equivalent, minimal_size, StateLock, StateDiscoverer, fit
-from task2 import build, gen_prose, scan
+from task2 import build, gen_prose, scan, probes, row_table, mixed
 
 def test_induce_exact(N=5):
     M = build(N)
@@ -43,8 +43,6 @@ def test_statelock_runs_exactly(delta, out, start, M, L=4096):
 
 def test_discover_small(N=3, K=32, steps=3000):
     M = build(N)
-    from refine2 import probes, row_table
-    from refine3 import mixed
     P = probes(M, n_deep=48)
     rng = np.random.default_rng(0)
     pools = []

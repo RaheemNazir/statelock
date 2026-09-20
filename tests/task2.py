@@ -63,3 +63,53 @@ if __name__ == "__main__":
         M = build(N)
         print({"entities": N, "vocab": M['V'], "raw_states": M['K'],
                "minimal_states": minimal_count(M['T'], M['lab'])})
+
+
+# --- helpers the discovery test needs -------------------------------------
+# These were imported from the author's working directory in 0.1.0, which is
+# why tests/test_all.py failed for everyone else with ModuleNotFoundError:
+# refine2. They live here now, so the test suite is self-contained.
+
+def probes(M, deep=True, n_deep=48, seed=0):
+    """The probe bundle: continuations whose labels the state must predict.
+
+    Built from the alphabet and the task's own sentence shape. Short probes
+    cannot separate states whose futures differ only after two sentences, which
+    is why the two-sentence continuations are included.
+    """
+    V, N, LINKS, DOT = M['V'], M['N'], M['LINKS'], M['DOT']
+    P = [()] + [(a,) for a in range(V)]
+    for a in range(N):
+        for b in range(N): P.append((a, LINKS, b, DOT))
+    if deep:
+        rng = np.random.default_rng(seed); seen = set()
+        while len(seen) < n_deep:
+            a, b, c, e = [int(rng.integers(0, N)) for _ in range(4)]
+            seen.add((a, LINKS, b, DOT, c, LINKS, e, DOT))
+        P += sorted(seen)
+    return P
+
+
+def row_table(M, P):
+    """rowtable[state, j] = the label after running probe j from that state."""
+    T, lab, K = M['T'], M['lab'], M['K']
+    R = np.empty((K, len(P)), np.int64)
+    for j, p in enumerate(P):
+        s = np.arange(K)
+        for t in p: s = T[t, s]
+        R[:, j] = lab[s]
+    return R
+
+
+def mixed(M, n, L, rng, frac_free=0.5):
+    """Half free token strings, half grammatical prose.
+
+    Training only on grammatical data leaves the learned table unconstrained on
+    strings the generator never emits, and exact equivalence explores every
+    string, so it fails while every held-out label is right.
+    """
+    n_free = int(n * frac_free)
+    Xf = rng.integers(0, M['V'], size=(n_free, L)).astype(np.int64)
+    Xp = gen_prose(M, n - n_free, L, rng)
+    X = np.concatenate([Xf, Xp], 0); rng.shuffle(X)
+    return X
