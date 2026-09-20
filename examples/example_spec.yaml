@@ -1,0 +1,30 @@
+# Which tools are irreversible, and what state they depend on.
+# Twenty lines like this is the whole configuration for a real agent.
+tracked:
+  file:
+    values: [exists, gone]
+    initial: exists
+    id_arg: path
+  order:
+    values: [open, charged, refunded]
+    initial: open
+    id_arg: order_id
+  access:
+    values: [granted, revoked]
+    initial: revoked
+    id_arg: user
+
+tools:
+  create_file:   {sets: {file: exists}}
+  delete_file:   {sets: {file: gone}, irreversible: true, requires: {file: exists}}
+  read_file:     {reads: [file]}
+  list_files:    {reads: [file]}
+
+  charge_order:  {sets: {order: charged}, irreversible: true, requires: {order: open}}
+  refund_order:  {sets: {order: refunded}, irreversible: true, requires: {order: charged}}
+  get_order:     {reads: [order]}
+
+  grant_access:  {sets: {access: granted}}
+  revoke_access: {sets: {access: revoked}}
+  use_access:    {irreversible: true, requires: {access: granted}}
+  check_access:  {reads: [access]}
