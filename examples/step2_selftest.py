@@ -1,6 +1,4 @@
-"""Test step2 logic with fake models (real weights cannot be downloaded here).
-Three fakes: always-no (the v1 failure mode), biased-but-informative (what
-calibration must rescue), and correct."""
+"""Test step2 v3 logic with fakes (real weights cannot be downloaded here)."""
 import random, sys
 sys.path.insert(0, '/home/claude/s2')
 import step2_real_model as S
@@ -18,26 +16,34 @@ print({"check": "prompt", "shots": prompt.count("Answer:") - 1,
 assert prompt.count("Answer:") - 1 == 4 and "Known groups" in prompt
 assert "Known groups" not in S.build_prompt(p, st, False)
 
-def run(fake_margin, name):
-    """Replay the scoring loop with a fake margin function."""
-    offset = fake_margin(S.build_prompt("N/A", "N/A", False))
-    hits = yes_pred = 0
-    for passage, ans, state in cases:
-        m = fake_margin(S.build_prompt(passage, state, True)) - offset
-        pred = "yes" if m > 0 else "no"
-        hits += int(pred == ans); yes_pred += int(pred == "yes")
-    n = len(cases)
-    r = {"fake": name, "accuracy": round(hits/n, 4), "yes_rate": round(yes_pred/n, 4),
-         "degenerate": yes_pred in (0, n)}
-    print(r); return r
+# AUC sanity
+print({"check": "auc_perfect", "auc": S.auc([1, 2, 3, 4], [0, 0, 1, 1])})
+print({"check": "auc_reversed", "auc": S.auc([4, 3, 2, 1], [0, 0, 1, 1])})
+print({"check": "auc_all_tied", "auc": S.auc([1, 1, 1, 1], [0, 0, 1, 1])})
+assert S.auc([1, 2, 3, 4], [0, 0, 1, 1]) == 1.0
+assert S.auc([4, 3, 2, 1], [0, 0, 1, 1]) == 0.0
+assert S.auc([1, 1, 1, 1], [0, 0, 1, 1]) == 0.5
 
 truth = {S.build_prompt(p, s, True): (a == "yes") for p, a, s in cases}
 
-r1 = run(lambda t: -5.0, "always_no")
-r2 = run(lambda t: (-3.0 + (1.0 if truth.get(t) else -1.0)), "biased_but_informative")
-r3 = run(lambda t: (1.0 if truth.get(t) else -1.0), "correct")
+def run(fake, name):
+    scores, labels = [], []
+    for passage, ans, state in cases:
+        scores.append(fake(S.build_prompt(passage, state, True)))
+        labels.append(1 if ans == "yes" else 0)
+    r = {"fake": name, "auc": round(S.auc(scores, labels), 4),
+         "acc_at_median": round(S.acc_at_median(scores, labels), 4),
+         "yes_rate_at_zero": round(sum(s > 0 for s in scores)/len(scores), 4)}
+    print(r); return r
 
-assert r1["degenerate"] and abs(r1["accuracy"] - 0.5) < 1e-9, "always-no must score exactly 0.5 and be flagged"
-assert r2["accuracy"] == 1.0 and not r2["degenerate"], "calibration must rescue a biased but informative model"
-assert r3["accuracy"] == 1.0
+import random as _r
+_rr = _r.Random(1)
+r1 = run(lambda t: 5.0, "always_yes_no_info")
+r2 = run(lambda t: 5.0 + (1.0 if truth.get(t) else -1.0), "always_yes_but_informative")
+r3 = run(lambda t: (1.0 if truth.get(t) else -1.0) + _rr.gauss(0, 1.0), "noisy_informative")
+
+assert r1["auc"] == 0.5, "a constant score must read as no information"
+assert r2["auc"] == 1.0 and r2["yes_rate_at_zero"] == 1.0, \
+    "signal must be visible even when the model answers yes to everything"
+assert 0.6 < r3["auc"] < 1.0
 print("SELFTEST PASSED")
