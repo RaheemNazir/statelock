@@ -1,5 +1,20 @@
-"""STEP 2, v3 -- does a real pretrained model track entity state over length,
+"""STEP 2, v4 -- does a real pretrained model track entity state over length,
 and does the verified state help?
+
+v3 FOUND A SIGNAL. On Qwen2.5-0.5B-Instruct, AUC fell from 0.78 to 0.61 as the
+passage grew, the supplied state held it at 0.91-1.00, and the gap widened with
+length. Two things could still explain that away, so v4 tests both.
+
+  WRONG-STATE CONTROL. The state arrives as an extra English sentence. Maybe any
+  extra sentence helps, by reminding the model of the names or the format. So a
+  third condition supplies a state sentence with the SAME SHAPE and the WRONG
+  CONTENT: a group drawn at random rather than the true one. If wrong_state
+  helps as much as with_state, the gain is presentation, not information. This
+  is the same role the shuffled-machine control plays in the paper.
+
+  SEEDS. v3 ran one seed. Three separate effects in this line of work crossed
+  conventional significance at small n and vanished at larger n, so three seeds
+  with per-seed numbers, and a bootstrap interval on every AUC.
 
 WHY v1 AND v2 MEASURED NOTHING, AND WHAT CHANGED.
   v1 scored accuracy against an unbalanced set, so a model answering one word
@@ -35,7 +50,9 @@ DEFAULT_MODELS = ["EleutherAI/pythia-160m", "Qwen/Qwen2.5-0.5B-Instruct"]
 NAMES = ["Alice", "Bob", "Carol", "Dave", "Erin"]
 LENGTHS = [8, 16, 32, 64, 128]
 N_PER_CLASS = 40
-SEED = 0
+SEEDS = [0, 1, 2]
+BOOTSTRAP = 2000
+CONDITIONS = ["plain", "with_state", "wrong_state"]
 
 
 def make_case(n_sent, rng):
@@ -57,15 +74,18 @@ def make_case(n_sent, rng):
     ans = "yes" if find(0) == find(1) else "no"
     group = [NAMES[i] for i in range(len(NAMES)) if find(i) == find(0)]
     state = "Known groups: " + ", ".join(group) + " are connected."
-    return " ".join(sents), ans, state
+    # the control: same sentence shape, content drawn at random
+    k = rng.randint(1, len(NAMES))
+    wrong = "Known groups: " + ", ".join(rng.sample(NAMES, k)) + " are connected."
+    return " ".join(sents), ans, state, wrong
 
 
 def balanced_cases(n_sent, n_per_class, rng, tries=20000):
     buckets = {"yes": [], "no": []}
     for _ in range(tries):
-        passage, ans, state = make_case(n_sent, rng)
+        passage, ans, state, wrong = make_case(n_sent, rng)
         if len(buckets[ans]) < n_per_class:
-            buckets[ans].append((passage, ans, state))
+            buckets[ans].append((passage, ans, state, wrong))
         if len(buckets["yes"]) == n_per_class and len(buckets["no"]) == n_per_class:
             break
     cases = buckets["yes"] + buckets["no"]
@@ -84,9 +104,23 @@ FEWSHOT = (
 )
 
 
-def build_prompt(passage, state, use_state):
-    body = passage + ((" " + state) if use_state else "")
-    return FEWSHOT + body + "\n" + QUESTION
+def build_prompt(passage, state, wrong, condition):
+    extra = {"plain": "", "with_state": " " + state, "wrong_state": " " + wrong}[condition]
+    return FEWSHOT + passage + extra + "\n" + QUESTION
+
+
+def bootstrap_ci(scores, labels, n_boot=BOOTSTRAP, seed=0):
+    """Percentile interval on AUC, resampling cases with replacement."""
+    import random as _r
+    rr = _r.Random(seed); n = len(scores); vals = []
+    idx = list(range(n))
+    for _ in range(n_boot):
+        pick = [idx[rr.randrange(n)] for _ in range(n)]
+        s = [scores[i] for i in pick]; l = [labels[i] for i in pick]
+        if 0 < sum(l) < n: vals.append(auc(s, l))
+    vals.sort()
+    if not vals: return (0.5, 0.5)
+    return (round(vals[int(0.025*len(vals))], 4), round(vals[int(0.975*len(vals))], 4))
 
 
 def auc(scores, labels):
@@ -134,42 +168,52 @@ def main():
         yes_id = tok(" yes", add_special_tokens=False).input_ids[-1]
         no_id = tok(" no", add_special_tokens=False).input_ids[-1]
 
-        per_length = {}
-        for L in LENGTHS:
-            for use_state in (False, True):
-                rng = random.Random(SEED + L)
+        table = {}
+        for seed in SEEDS:
+            for L in LENGTHS:
+                rng = random.Random(1000 * seed + L)
                 cases = balanced_cases(L, N_PER_CLASS, rng)
-                scores, labels = [], []
-                for passage, ans, state in cases:
-                    scores.append(margin(model, tok,
-                                         build_prompt(passage, state, use_state),
-                                         yes_id, no_id, device))
-                    labels.append(1 if ans == "yes" else 0)
-                a = auc(scores, labels)
-                rec = {"model": model_id, "sentences": L,
-                       "condition": "with_state" if use_state else "plain",
-                       "auc": round(a, 4),
-                       "acc_at_median": round(acc_at_median(scores, labels), 4),
-                       "yes_rate_at_zero": round(sum(s > 0 for s in scores)/len(scores), 4),
-                       "mean_margin": round(sum(scores)/len(scores), 4),
-                       "n": len(cases), "chance_auc": 0.5}
-                per_length.setdefault(L, {})[rec["condition"]] = a
-                print(rec, flush=True); out.append(rec)
-        print("  paired, with_state minus plain, by length:", flush=True)
+                for cond in CONDITIONS:
+                    scores, labels = [], []
+                    for passage, ans, state, wrong in cases:
+                        scores.append(margin(model, tok,
+                                             build_prompt(passage, state, wrong, cond),
+                                             yes_id, no_id, device))
+                        labels.append(1 if ans == "yes" else 0)
+                    a = auc(scores, labels)
+                    lo, hi = bootstrap_ci(scores, labels, seed=seed)
+                    rec = {"model": model_id, "seed": seed, "sentences": L,
+                           "condition": cond, "auc": round(a, 4),
+                           "auc_ci95": [lo, hi],
+                           "acc_at_median": round(acc_at_median(scores, labels), 4),
+                           "yes_rate_at_zero": round(sum(x > 0 for x in scores)/len(scores), 4),
+                           "mean_margin": round(sum(scores)/len(scores), 4),
+                           "n": len(cases), "chance_auc": 0.5}
+                    table.setdefault((L, cond), []).append(a)
+                    print(rec, flush=True); out.append(rec)
+
+        print("\n  AUC by length, mean over seeds:", flush=True)
+        print(f"  {'len':>5} {'plain':>18} {'with_state':>18} {'wrong_state':>18}", flush=True)
         for L in LENGTHS:
-            d = per_length[L]["with_state"] - per_length[L]["plain"]
-            print(f"    {L:4d} sentences:  {d:+.4f} AUC", flush=True)
+            cells = []
+            for cond in CONDITIONS:
+                v = table[(L, cond)]
+                cells.append(f"{sum(v)/len(v):.3f} ({min(v):.2f}-{max(v):.2f})")
+            print(f"  {L:>5} {cells[0]:>18} {cells[1]:>18} {cells[2]:>18}", flush=True)
+        print("\n  gaps over plain, mean over seeds:", flush=True)
+        for L in LENGTHS:
+            p = sum(table[(L, "plain")]) / len(table[(L, "plain")])
+            w = sum(table[(L, "with_state")]) / len(table[(L, "with_state")])
+            x = sum(table[(L, "wrong_state")]) / len(table[(L, "wrong_state")])
+            print(f"    {L:>4}:  with_state {w-p:+.3f}   wrong_state {x-p:+.3f}", flush=True)
+        print("\n  READING: with_state must beat plain AND wrong_state. If "
+              "wrong_state gains as much, the effect is the extra sentence, not "
+              "the information it carries.", flush=True)
         del model
         if device == "cuda": torch.cuda.empty_cache()
 
     json.dump(out, open("step2_results.json", "w"), indent=1)
     print("\nwritten step2_results.json")
-    best = max((r["auc"] for r in out), default=0.5)
-    if best < 0.55:
-        print("READING: every AUC is at or near 0.50. These models carry no usable "
-              "information about the answer at any length, so this task is beyond "
-              "them rather than being lost over length. That is a finding about "
-              "model scale, not about statelock, and it should be reported as such.")
 
 
 if __name__ == "__main__":
