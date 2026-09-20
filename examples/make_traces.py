@@ -7,8 +7,7 @@ number that was planted.
 
   python make_traces.py            writes three traces and prints what is in them
 """
-import json, random, sys
-sys.path.insert(0, "../..")
+import json, os, random
 
 FILES = ["report.txt", "data.csv", "notes.md"]
 ORDERS = ["A17", "B42"]
@@ -85,7 +84,8 @@ def mixed(n, planted=5, seed=0):
 
 
 if __name__ == "__main__":
+    here = os.path.dirname(os.path.abspath(__file__))
     for name, fn in (("clean.jsonl", clean), ("stale.jsonl", stale), ("mixed.jsonl", mixed)):
         ev, planted = fn(60)
-        write(name, ev)
+        write(os.path.join(here, name), ev)
         print(f"{name:<14} {len(ev):>4} events, planted stale-state actions: {planted}")
